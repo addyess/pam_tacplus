@@ -38,6 +38,12 @@ def __net_class(name):
     # struct sockaddr_in6 from sys/socket.h
     class In6Addr(ctypes.Structure):
         _fields_ = [('s6_addr', ctypes.c_ubyte * 16)]
+        def __repr__(self):
+            '''Print the fields'''
+            n_byte_order_unpacked = tuple(self.s6_addr)
+            n_byte_order_packed   = struct.pack('!BBBBBBBBBBBBBBBB', *n_byte_order_unpacked)
+            #inet_ntoa takes packed in network byte order
+            return socket.inet_ntop(socket.AF_INET6, n_byte_order_packed)
 
     class SockAddrIn6(ctypes.Structure):
         _fields_ = [('sin6_family',   ctypes.c_uint16),
@@ -45,6 +51,18 @@ def __net_class(name):
                     ('sin6_flowinfo', ctypes.c_uint32),
                     ('sin6_addr',     In6Addr),
                     ('sin6_scope_id', ctypes.c_uint32)]
+        def interp (self, field_id, value):
+            switcher = { 0 : lambda x : 'v4' if (x == socket.AF_INET ) else 'v6',
+                         1 : lambda x : socket.ntohs(x)
+                       }
+            return switcher[field_id](value) if field_id in switcher else repr(value)
+    
+        def __repr__(self):
+            '''Print the fields'''
+            res = []
+            for idx, field in enumerate(self._fields_):
+                res.append('{}={}'.format(field[0], self.interp(idx, getattr(self, field[0]) ) ) )
+            return self.__class__.__name__ + '(' + ','.join(res) + ')'
     
     # struct addrinfo from netdb.h
     class AddrInfo(ctypes.Structure):
@@ -153,7 +171,7 @@ ServerParameter     = namedtuple('ServerParameter',     ['hostname','port'])
 ConnectionParameter = namedtuple('ConnectionParameter', ['server','key'])
 
 class TacError(Exception):
-    def __init__(self, k):
+    def __init__(self, k, reason = None):
         errors = { -9: 'Connection Error',   # -9
                    -8: 'Connection Timeout', # -8
                    -7: 'Short Body',         # -7
@@ -165,7 +183,9 @@ class TacError(Exception):
                    -1: 'Assembly Error',     # -1
                  }
         
-        super(TacError, self).__init__( errors[k] if k in errors else 'Unknown Error')
+        error = (errors[k] if k in errors else 'Unknown Error')
+        error = '-'.join([error,reason]) if reason else error
+        super(TacError, self).__init__( error )
         
 class AccountingFlags():
     more     = 1
@@ -320,12 +340,14 @@ def   connect(connection, login_type = None):
     
     rval = -9
     if type(connection) == list:
-        for conn in connection:
-            try:
-                return connect(conn)
-            except TacError:
-                pass
-        raise TacError(rval)
+        if len(connection) > 0:
+            for conn in connection:
+                try:
+                    return connect(conn)
+                except TacError as rval:
+                    pass
+            raise rval
+        raise TacError(-9, 'Empty Connection List')
     elif type(connection) != ConnectionParameter:
         raise TypeError("not a Connection tuple")
     elif type(connection.key) != str:
@@ -347,18 +369,27 @@ def   connect(connection, login_type = None):
         _addrinfo.ai_protocol  = ai[2]
         _addrinfo.ai_canonname = ai[3]
         
-        if len(ai[4]) is socket.AF_INET:
-            v4addr = __net_class('SockAddrIn4')()
-            v4addr.sin_family      = ai[0]
-            v4addr.sin_port        = socket.htons(ai[4][1])
-            n_byte_order_packed    = socket.inet_aton(ai[4][0])
-            n_byte_order_unpacked  = socket.htonl(struct.unpack("!L", n_byte_order_packed)[0])
-            v4addr.sin_addr.s_addr = n_byte_order_unpacked 
-            _addrinfo.ai_addrlen   = ctypes.sizeof(v4addr)
-            _addrinfo.ai_addr      = ctypes.cast(ctypes.pointer(v4addr), ctypes.c_void_p)
+        if ai[0] == socket.AF_INET:
+            sock_addr = __net_class('SockAddrIn4')()
+            sock_addr.sin_family      = ai[0]
+            sock_addr.sin_port        = socket.htons(ai[4][1])
+            n_byte_order_packed       = socket.inet_aton(ai[4][0])
+            n_byte_order_unpacked     = socket.htonl(struct.unpack("!L", n_byte_order_packed)[0])
+            sock_addr.sin_addr.s_addr = n_byte_order_unpacked 
+        elif ai[0] == socket.AF_INET6:
+            sock_addr = __net_class('SockAddrIn6')()
+            sock_addr.sin6_family       = ai[0]
+            n_byte_order_packed         = socket.inet_pton(socket.AF_INET6, ai[4][0])
+            n_byte_order_unpacked       = struct.unpack("!BBBBBBBBBBBBBBBB", n_byte_order_packed)
+            sock_addr.sin6_addr.s6_addr = (ctypes.c_ubyte * 16)(*n_byte_order_unpacked)
+            sock_addr.sin6_port         = socket.htons(ai[4][1])
+            sock_addr.sin6_flowinfo     = socket.htons(ai[4][2])
+            sock_addr.sin6_scope_id     = socket.htons(ai[4][3])
         
+        _addrinfo.ai_addrlen   = ctypes.sizeof(sock_addr)
+        _addrinfo.ai_addr      = ctypes.cast(ctypes.pointer(sock_addr), ctypes.c_void_p)
         rVal = libtac.tac_connect_single(ctypes.pointer(_addrinfo), _key, None)
         if rVal >= 0:
             return Connection(socket.fromfd(rVal,ai[0],ai[1],ai[2]))
     
-    raise TacError(rval)
+    raise TacError(rval, ai[4][0])
